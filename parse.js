@@ -60,6 +60,14 @@ function isWS(ch) { return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\
 function isPunct(ch) { return ch !== undefined && (ASCII_PUNCT.has(ch) || PUNCT_RE.test(ch)); }
 function isSpace(ch) { return ch === ' ' || ch === '\t' || ch === '\n'; }
 
+function geText(s) {
+  // marked's ge(): strip trailing blank lines, but only when there are
+  // 2+ of them (a single trailing newline is kept)
+  const e = s.split('\n');
+  let t = e.length - 1;
+  for (; t >= 0 && /^[ \t]*$/.test(e[t]);) t--;
+  return e.length - t <= 2 ? s : e.slice(0, t + 1).join('\n');
+}
 function escapeHtml(s, encode) {
   let out = '', start = 0;
   for (let i = 0; i < s.length; i++) {
@@ -1376,7 +1384,11 @@ export function parse(src) {
     if (c !== '>') return null;
     let nc = { pos: m.cur3.pos + 1, col: m.cur3.col + 1, pend: m.cur3.pend };
     // one optional space/tab column
-    if (nc.pend === 0 && nc.pos < line.length && (line[nc.pos] === ' ' || line[nc.pos] === '\t')) nc = adv(line, nc, 1);
+    let tabAfterGt = false;
+    if (nc.pend === 0 && nc.pos < line.length && (line[nc.pos] === ' ' || line[nc.pos] === '\t')) {
+      tabAfterGt = line[nc.pos] === '\t';
+      nc = adv(line, nc, 1);
+    }
     else if (nc.pend > 0) nc = adv(line, nc, 1);
     // marked expands the whitespace after '>' with J(ws, bLen) — a tab
     // becomes spaces by column, where bLen is the length of the '>'
@@ -1392,6 +1404,17 @@ export function parse(src) {
       else { expanded += ' '; col++; }
     }
     nc.lead = expanded.length > 0 ? expanded.slice(1) : '';
+    // a tab right after '>' was partially consumed by the adv(1) above,
+    // which measured its width from the ABSOLUTE column; marked expands
+    // it from the RELATIVE column (bLen), so the remainder is
+    // 4 - (bLen % 4) - 1 (bLen 1: the tab is 3 wide, 1 consumed, 2 remain
+    // — not the absolute 3). A remainder of 0 means the tab is fully
+    // consumed: step past it.
+    if (tabAfterGt && nc.pend > 0) {
+      const rem = 4 - (bLen % 4) - 1;
+      if (rem === 0) { nc.pos++; nc.pend = 0; }
+      else nc.pend = rem;
+    }
     return nc;
   }
   function matchItem(line, cur, item) {
@@ -1482,6 +1505,83 @@ export function parse(src) {
     openPara = p;
     return p;
   }
+  function matchContainers(line, depth) {
+    // match stack[1..depth-1] on line (mode-loop semantics); returns
+    // {ok, cur, skippedBlank} — skippedBlank is true when an item frame
+    // was skipped because the line is blank from that frame, so the line
+    // is blank in the inner text even if lineFromCur shows spaces
+    let cur = { pos: 0, col: 0, pend: 0 };
+    let skippedBlank = false;
+    for (let d = 1; d < depth; d++) {
+      const f = stack[d];
+      if (f.kind === 'quote') {
+        const r = matchQuote(line, cur);
+        if (!r) return { ok: false };
+        cur = r;
+      } else if (f.kind === 'list') {
+        continue;
+      } else if (f.kind === 'item') {
+        if (blankFrom(line, cur)) { skippedBlank = true; continue; }
+        const r = matchItem(line, cur, f);
+        if (!r) return { ok: false };
+        cur = r;
+      }
+    }
+    return { ok: true, cur, skippedBlank };
+  }
+  // stripped line is empty in the inner text when an item was skipped for
+  // blankness or the remainder is exactly empty (a whitespace-only
+  // remainder is NOT empty: marked's html regex stops at it)
+  function stripEmpty(m, line) {
+    if (!m.ok) return false;
+    if (m.skippedBlank) return true;
+    return lineFromCur(line, m.cur) === '';
+  }
+  function htmlTrailNL(li, depth) {
+    // li = index of an html block's last content line, living in
+    // containers stack[1..depth-1]. Decides whether the block's text
+    // keeps a trailing '\n', per marked's ge() over the regex match in
+    // the container-stripped inner text: the match consumes the newlines
+    // after the block, and ge() strips it when 2+ trailing blank lines
+    // follow (k = 1 + empty lines after the block, in the inner text).
+    if (li + 1 >= lines.length) return depth <= 1 ? hasFinalNL : false;
+    const first = matchContainers(lines[li + 1], depth);
+    if (!first.ok) return false; // next line is outside the containers
+    if (!stripEmpty(first, lines[li + 1])) return true; // non-blank next line
+    if (depth <= 1) return false; // top level: a blank line adds a newline
+    const inner = stack[depth - 1];
+    if (inner.kind === 'quote') {
+      // NL kept iff the blank line is the inner text's last line; any
+      // further line in the quote makes the newline run reach 2+
+      const nx = li + 2 < lines.length ? matchContainers(lines[li + 2], depth) : null;
+      return !nx || !nx.ok;
+    }
+    if (inner.kind === 'item') {
+      // count the consecutive empty lines after the block (B), then see
+      // what follows them: item content -> interior blanks (strip); a
+      // sibling item -> k == B (NL kept iff B == 1); anything else -> the
+      // item is last and its text is trimEnd'd (strip)
+      let B = 1, k = li + 2;
+      for (; k < lines.length; k++) {
+        const m = matchContainers(lines[k], depth);
+        if (!m.ok) break;
+        if (stripEmpty(m, lines[k])) { B++; continue; }
+        return false; // content inside the item: blanks are interior
+      }
+      const list = stack[depth - 2];
+      for (; k < lines.length; k++) {
+        const line = lines[k];
+        const pm = matchContainers(line, depth - 1);
+        if (!pm.ok) return false;
+        if (stripEmpty(pm, line)) continue; // another blank line
+        const lm = listMarker(line, pm.cur);
+        if (lm && listMatches(list, lm) && !thematicBreak(line, pm.cur)) return B === 1;
+        return false;
+      }
+      return false;
+    }
+    return true;
+  }
   function endMode(finalize) {
     const md = mode; mode = null;
     finalize(md);
@@ -1512,12 +1612,17 @@ export function parse(src) {
         // empty fence), and a missing '>' ends a fence inside a QUOTE
         // (the quote ends, so the fence inside it ends too). Other modes
         // end and the line is reprocessed.
-        if (mode.type === 'fence' && mode.lines.length > 0 && !/^[ \t]*$/.test(line) && stack[depth] && stack[depth].kind === 'item') {
+        // BUT a line that starts a block at the outer level (a list
+        // marker, a fence, a heading, a thematic break, an html block, a
+        // quote) is NOT swallowed: the fence ends and the line is
+        // reprocessed as that block (doc-36: a sibling '* Pull' item;
+        // S4/S10: '- bar' / '~~~' after fence content).
+        if (mode.type === 'fence' && mode.lines.length > 0 && !/^[ \t]*$/.test(line) && stack[depth] && stack[depth].kind === 'item' && !startsInterrupt(line, cur)) {
           mode.lines.push(stripCols(line, cur, mode.indent, true, true));
           continue;
         }
         // end mode without closing fence, reprocess line
-        if (mode.type === 'html' && mode.trailNL === undefined) mode.trailNL = true;
+        if (mode.type === 'html' && mode.trailNL === undefined) mode.trailNL = false;
         // an indented code block ending by container mismatch drops its
         // trailing blank lines, exactly as the indent<4 path does
         if (mode.type === 'indent') mode.lines.length -= mode.pb.length;
@@ -1569,8 +1674,7 @@ export function parse(src) {
             // peek next line: a truly EMPTY line eats the trailing NL
             // (marked's ge() strips 2+ trailing blank lines); a
             // whitespace-only line keeps it (only 1 trailing NL)
-            const next = li + 1 < lines.length ? lines[li + 1] : null;
-            mode.trailNL = next === null ? hasFinalNL : next !== '';
+            mode.trailNL = htmlTrailNL(li, mode.depth);
             endMode(finishMode);
           }
         }
@@ -1638,7 +1742,7 @@ export function parse(src) {
   }
   // EOF: finish open mode / close frames
   if (mode) {
-    if (mode.type === 'html') mode.trailNL = hasFinalNL;
+    if (mode.type === 'html') mode.trailNL = mode.depth <= 1 ? hasFinalNL : false;
     if (mode.type === 'indent') mode.lines.length -= mode.pb.length; // drop trailing blanks
     endMode(finishMode);
   }
@@ -1663,7 +1767,7 @@ export function parse(src) {
     } else if (md.type === 'html') {
       let text = md.lines.join('\n');
       if (md.trailNL) text += '\n';
-      pushStr(md.out, text);
+      pushStr(md.out, geText(text));
     }
   }
   function tableRowEnds(line, cur) {
@@ -1862,7 +1966,7 @@ export function parse(src) {
       const firstLine = lineFromCur(line, cur);
       mode = { type: 'html', out: frame.out, lines: [firstLine], endType: hb, tagName, depth: stack.length, trailNL: hb >= 6 ? false : undefined };
       if (hb < 6 && htmlEndLine(hb, firstLine, tagName)) {
-        mode.trailNL = li + 1 < lines.length ? lines[li + 1] !== '' : hasFinalNL;
+        mode.trailNL = htmlTrailNL(li, stack.length);
         endMode(finishMode);
       }
       return null;
